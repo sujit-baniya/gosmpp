@@ -70,4 +70,5 @@ type Settings struct {
 	RateLimiter *rate.Limiter
 
 	response func(pdu.PDU)
+	Throttle int
 }

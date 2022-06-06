@@ -1,23 +1,29 @@
 package smpp
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"github.com/rs/xid"
+	"golang.org/x/time/rate"
 	"sync/atomic"
 	"time"
 )
 
 // Session represents session for TX, RX, TRX.
 type Session struct {
-	c Connector
-
+	ID               string
+	c                Connector
+	closed           bool
 	originalOnClosed func(State)
 	settings         Settings
 
 	rebindingInterval time.Duration
 
-	trx atomic.Value // transceivable
-
+	trx       atomic.Value // transceivable
+	throttle  *rate.Limiter
+	rwctx     context.Context
+	lmctx     context.Context
 	state     int32
 	rebinding int32
 }
@@ -38,6 +44,7 @@ func NewSession(c Connector, settings Settings, rebindingInterval time.Duration)
 	conn, err := c.Connect()
 	if err == nil {
 		session = &Session{
+			ID:                xid.New().String(),
 			c:                 c,
 			rebindingInterval: rebindingInterval,
 			originalOnClosed:  settings.OnClosed,
@@ -61,7 +68,11 @@ func NewSession(c Connector, settings Settings, rebindingInterval time.Duration)
 		} else {
 			session.settings = settings
 		}
-
+		if session.settings.Throttle != 0 {
+			rateLimiter := rate.NewLimiter(rate.Limit(settings.Throttle), 1)
+			session.rwctx = context.Background()
+			session.throttle = rateLimiter
+		}
 		// bind to session
 		session.trx.Store(newTransceivable(conn, session.settings))
 	}
@@ -102,9 +113,17 @@ func (s *Session) Close() (err error) {
 
 func (s *Session) close() (err error) {
 	if b := s.bound(); b != nil {
+		s.closed = true
 		err = b.Close()
 	}
 	return
+}
+
+func (s *Session) Wait() error {
+	if s.throttle != nil {
+		return s.throttle.Wait(s.rwctx)
+	}
+	return nil
 }
 
 func (s *Session) rebind() {
@@ -129,4 +148,8 @@ func (s *Session) rebind() {
 			}
 		}
 	}
+}
+
+func (s *Session) IsClosed() bool {
+	return s.closed
 }
