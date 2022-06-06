@@ -2,14 +2,14 @@ package main
 
 import (
 	"fmt"
-	"github.com/linxGnu/gosmpp/coding"
+	"github.com/sujit-baniya/protocol/smpp"
+	"github.com/sujit-baniya/protocol/smpp/coding"
 	"log"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/linxGnu/gosmpp"
-	"github.com/linxGnu/gosmpp/pdu"
+	"github.com/sujit-baniya/protocol/smpp/pdu"
 )
 
 func main() {
@@ -24,16 +24,16 @@ func main() {
 func sendingAndReceiveSMS(wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	auth := gosmpp.Auth{
+	auth := smpp.Auth{
 		SMSC:       "smscsim.melroselabs.com:2775",
 		SystemID:   "169994",
 		Password:   "EDXPJU",
 		SystemType: "",
 	}
 
-	trans, err := gosmpp.NewSession(
-		gosmpp.TRXConnector(gosmpp.NonTLSDialer, auth),
-		gosmpp.Settings{
+	trans, err := smpp.NewSession(
+		smpp.TRXConnector(smpp.NonTLSDialer, auth),
+		smpp.Settings{
 			EnquireLink: 5 * time.Second,
 
 			ReadTimeout: 10 * time.Second,
@@ -52,12 +52,12 @@ func sendingAndReceiveSMS(wg *sync.WaitGroup) {
 
 			OnPDU: handlePDU(),
 
-			OnClosed: func(state gosmpp.State) {
+			OnClosed: func(state smpp.State) {
 				fmt.Println(state)
 			},
 		}, 5*time.Second)
 	if err != nil {
-		log.Println(err)
+		panic(err)
 	}
 	defer func() {
 		_ = trans.Close()
