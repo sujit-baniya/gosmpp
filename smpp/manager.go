@@ -2,70 +2,107 @@ package smpp
 
 import (
 	"context"
-	"errors"
-	"github.com/rs/xid"
+	"fmt"
+	"github.com/go-errors/errors"
 	"github.com/sujit-baniya/protocol/smpp/balancer"
+	"github.com/sujit-baniya/protocol/smpp/coding"
 	"github.com/sujit-baniya/protocol/smpp/pdu"
-	"golang.org/x/time/rate"
+	"log"
+	"math/rand"
+	"net"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
+
+	"github.com/rs/xid"
 )
+
+type ConnectionInterface interface {
+	Send(packet interface{}) (err error)
+	Throttle() error
+}
 
 type ManagerInterface interface {
 	Start() error
-	AddSession(noOfSession ...int) (string, error)
-	GetSession(sessionId ...string) *Session
-	RemoveSession(sessionId ...string) error
-	Rebind(sessionId ...string)
-	Submit(pd pdu.PDU, sessionId ...string) error
-	Close(noOfSession ...int) error
+	AddConnection(noOfConnection ...int) error
+	RemoveConnection(connectionID ...string) error
+	GetConnection(conIds ...string) (*Session, error)
+	SetupConnection() error
+	Rebind() error
+	Send(payload interface{}, connectionID ...string) (interface{}, error)
+	Close(connectionID ...string) error
 }
 
-type ManagerConfig struct {
-	Name           string
-	Slug           string
-	Auth           Auth
-	Settings       Settings
-	RebindDuration time.Duration
-	MaxSession     int
-	Balancer       balancer.Balancer
+type Setting struct {
+	Name             string
+	Slug             string
+	URL              string
+	Auth             Auth
+	ReadTimeout      time.Duration
+	WriteTimeout     time.Duration
+	EnquiryInterval  time.Duration
+	EnquiryTimeout   time.Duration
+	MaxConnection    int
+	Balancer         balancer.Balancer
+	Throttle         int
+	UseAllConnection bool
+	HandlePDU        func(con *Session)
+	OnPDU            PDUCallback
+	AutoRebind       bool
 }
 
 type Manager struct {
 	Name        string
 	Slug        string
 	ID          string
-	Session     map[string]*Session
-	balancer    balancer.Balancer
-	SessionIDs  []string
-	Config      ManagerConfig
-	MaxSession  int
-	RebindWait  *rate.Limiter
-	RateLimiter *rate.Limiter
-	rwctx       context.Context
-	lmctx       context.Context
+	ctx         context.Context
+	setting     Setting
+	connections map[string]*Session
+	Balancer    balancer.Balancer
+	connIDs     []string
 	mu          sync.RWMutex
 }
 
-func NewSessionManager(cfg ManagerConfig) ManagerInterface {
-	if cfg.MaxSession == 0 {
-		cfg.MaxSession = 4
+type HandlePDU func(conn *Session)
+
+type Message struct {
+	From    string
+	To      string
+	Message string
+}
+
+func NewManager(setting Setting) (*Manager, error) {
+	if setting.MaxConnection == 0 {
+		setting.MaxConnection = 1
 	}
-	if cfg.Balancer == nil {
-		cfg.Balancer = &balancer.RoundRobin{}
+	manager := &Manager{
+		Name:        setting.Name,
+		Slug:        setting.Slug,
+		ID:          xid.New().String(),
+		ctx:         context.Background(),
+		setting:     setting,
+		connections: make(map[string]*Session),
 	}
-	return &Manager{
-		Name:       cfg.Name,
-		ID:         xid.New().String(),
-		Config:     cfg,
-		balancer:   cfg.Balancer,
-		MaxSession: cfg.MaxSession,
+	if setting.Balancer == nil {
+		manager.Balancer = &balancer.RoundRobin{}
 	}
+	return manager, nil
 }
 
 func (m *Manager) Start() error {
-	if m.Session == nil {
-		_, err := m.AddSession(m.MaxSession)
+	if m.setting.UseAllConnection {
+		for i := 0; i < m.setting.MaxConnection; i++ {
+			err := m.SetupConnection()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if len(m.connIDs) == 0 {
+		err := m.SetupConnection()
 		if err != nil {
 			return err
 		}
@@ -73,107 +110,291 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-func (m *Manager) AddSession(noOfSession ...int) (string, error) {
-	if len(noOfSession) == 0 {
-		return m.addSession()
+func (m *Manager) AddConnection(noOfConnection ...int) error {
+	con := 1
+	if len(noOfConnection) > 0 {
+		con = noOfConnection[0]
 	}
-	if noOfSession[0] > m.MaxSession {
-		return "", errors.New("Can't create more than allowed no of sessions.")
+	if con > m.setting.MaxConnection {
+		return errors.New("Can't create more than allowed no of connections.")
 	}
-	if (len(m.Session) + noOfSession[0]) > m.MaxSession {
-		return "", errors.New("There are active sessions. Can't create more than allowed no of sessions.")
+	if (len(m.connIDs) + con) > m.setting.MaxConnection {
+		return errors.New("There are active sessions. Can't create more than allowed no of sessions.")
 	}
-	for i := 0; i < noOfSession[0]; i++ {
-		_, err := m.addSession()
+	connLeft := m.setting.MaxConnection - len(m.connIDs)
+	n := 0
+	if connLeft >= con {
+		n = con
+	} else {
+		n = connLeft
+	}
+	for i := 0; i < n; i++ {
+		err := m.SetupConnection()
 		if err != nil {
-			return "", err
+			return err
 		}
 	}
-	return "", nil
+	return nil
 }
 
-func (m *Manager) RemoveSession(sessionId ...string) error {
-	if len(sessionId) > 0 {
-		return m.close(sessionId[0])
+func (m *Manager) RemoveConnection(conID ...string) error {
+	if len(conID) > 0 {
+		for _, id := range conID {
+			if con, ok := m.connections[id]; ok {
+				err := con.Close()
+				if err != nil {
+					return err
+				}
+				m.connIDs = remove(m.connIDs, id)
+				delete(m.connections, id)
+			}
+		}
 	} else {
-		return m.Close()
+		for id, con := range m.connections {
+			err := con.Close()
+			if err != nil {
+				return err
+			}
+			m.connIDs = remove(m.connIDs, id)
+			delete(m.connections, id)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) Rebind() error {
+	err := m.Close()
+	if err != nil {
+		return err
+	}
+	m.connections = make(map[string]*Session)
+	m.connIDs = []string{}
+	err = m.Start()
+	if err != nil {
+		return err
+	}
+	return m.HandlePDU()
+}
+
+func (m *Manager) SetupConnection() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, err := net.Dial("tcp", m.setting.URL)
+	if err != nil {
+		return err
+	}
+
+	smppSetting := Settings{
+		EnquireLink:  m.setting.EnquiryInterval,
+		WriteTimeout: m.setting.WriteTimeout,
+		ReadTimeout:  m.setting.ReadTimeout,
+
+		OnSubmitError: func(_ pdu.PDU, err error) {
+			log.Fatal("SubmitPDU error:", err)
+		},
+
+		OnReceivingError: func(err error) {
+			fmt.Println("Receiving PDU/Network error:", err)
+		},
+
+		OnRebindingError: func(err error) {
+			fmt.Println("Rebinding but error:", err)
+		},
+
+		OnPDU: m.setting.OnPDU,
+
+		OnClosed: func(state State) {
+			fmt.Println(state)
+		},
+	}
+	conn, err := NewSession(TRXConnector(NonTLSDialer, m.setting.Auth), smppSetting, m.setting.EnquiryTimeout)
+	if err != nil {
+		return err
+	}
+	m.connIDs = append(m.connIDs, conn.ID)
+	m.connections[conn.ID] = conn
+	return nil
+}
+
+func (m *Manager) GetConnection(conIds ...string) (*Session, error) {
+	var pickedID string
+	if len(conIds) > 0 { // pick among custom
+		pickedID, err := m.Balancer.Pick(conIds)
+		if err != nil {
+			return nil, err
+		}
+		if con, ok := m.connections[pickedID]; ok {
+			return con, nil
+		}
+	}
+
+	// pick among managing session
+	pickedID, err := m.Balancer.Pick(m.connIDs)
+	if err != nil {
+		return nil, err
+	}
+	if con, ok := m.connections[pickedID]; ok {
+		return con, nil
+	}
+	return nil, errors.New("no connection")
+}
+
+type SmppResponse struct {
+	SubmitSM     *pdu.SubmitSM     `json:"submit_sm"`
+	SubmitSMResp *pdu.SubmitSMResp `json:"submit_sm_resp"`
+}
+
+func (m *Manager) Send(payload interface{}, connectionId ...string) (interface{}, error) {
+	sms := payload.(Message)
+	shortMessages, err := m.Compose(sms.Message)
+	if err != nil {
+		panic(err)
+	}
+
+	var responses []SmppResponse
+	responseChan := make(chan map[*pdu.SubmitSM]*pdu.SubmitSMResp)
+	wg := &sync.WaitGroup{}
+	for _, shortMessage := range shortMessages {
+		wg.Add(1)
+		go m.SendShortMessage(sms.From, sms.To, shortMessage, wg, responseChan, connectionId...)
+	}
+	go func() {
+		wg.Wait()
+		close(responseChan)
+	}()
+	for response := range responseChan {
+		for submitSM, submitSMResp := range response {
+			responses = append(responses, SmppResponse{
+				SubmitSM:     submitSM,
+				SubmitSMResp: submitSMResp,
+			})
+		}
+	}
+	return responses, nil
+}
+
+func (m *Manager) SendShortMessage(from string, to string, shortMessage pdu.ShortMessage, wg *sync.WaitGroup, responseChan chan<- map[*pdu.SubmitSM]*pdu.SubmitSMResp, connectionId ...string) error {
+	defer wg.Done()
+	conn, err := m.GetConnection(connectionId...)
+	if err != nil {
+		return err
+	}
+	packet := m.Prepare(from, to, shortMessage)
+	err = conn.Wait()
+	if err != nil {
+		return err
+	}
+	err = conn.Transceiver().Submit(packet)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) Prepare(from string, to string, shortMessage pdu.ShortMessage) *pdu.SubmitSM {
+	return &pdu.SubmitSM{
+		SourceAddr:         parseSrcPhone(from),
+		DestAddr:           parseDestPhone(to),
+		RegisteredDelivery: 1,
+		Message:            shortMessage,
+		EsmClass:           0,
 	}
 }
 
-func (m *Manager) Close(noOfSession ...int) error {
-	if len(noOfSession) == 0 {
-		for id := range m.Session {
-			err := m.close(id)
+func (m *Manager) Close(connectionId ...string) error {
+	if len(connectionId) > 0 {
+		if con, ok := m.connections[connectionId[0]]; ok {
+			err := con.Close()
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		for _, conn := range m.connections {
+			err := conn.Close()
 			if err != nil {
 				return err
 			}
 		}
 	}
+
 	return nil
 }
 
-func (m *Manager) Rebind(sessionId ...string) {
-	if len(sessionId) == 0 {
-		if session, ok := m.Session[sessionId[0]]; ok {
-			session.rebind()
-		}
-	}
-}
-
-func (m *Manager) Submit(pd pdu.PDU, sessionId ...string) error {
-	session := m.getSession(sessionId...)
-	if session == nil {
-		return errors.New("Session not found")
-	}
-	err := session.Wait()
-	if err != nil {
-		return err
-	}
-	return session.Transceiver().Submit(pd)
-}
-
-func (m *Manager) GetSession(sessionIDs ...string) *Session {
-	return m.getSession(sessionIDs...)
-}
-
-func (m *Manager) getSession(sessionIDs ...string) *Session {
-	var pickedID string
-	if len(sessionIDs) > 0 { // pick among custom
-		pickedID, _ = m.balancer.Pick(sessionIDs)
-		if session, ok := m.Session[pickedID]; ok {
-			return session
-		}
-	}
-
-	// pick among managing session
-	pickedID, _ = m.balancer.Pick(m.SessionIDs)
-	session, _ := m.Session[pickedID]
-	return session
-}
-
-func (m *Manager) addSession() (string, error) {
-	if m.Session == nil {
-		m.Session = make(map[string]*Session)
-	}
-	session, err := NewSession(
-		TRXConnector(NonTLSDialer, m.Config.Auth),
-		m.Config.Settings,
-		m.Config.RebindDuration,
-	)
-	if err != nil {
-		return "", err
-	}
-	m.Session[session.ID] = session
-	m.SessionIDs = append(m.SessionIDs, session.ID)
-	return session.ID, nil
-}
-
-func (m *Manager) close(sessionId string) error {
-	if !m.Session[sessionId].IsClosed() {
-		err := m.Session[sessionId].close()
-		if err != nil {
-			return err
-		}
+func (m *Manager) HandlePDU() error {
+	for _, conn := range m.connections {
+		go m.setting.HandlePDU(conn)
 	}
 	return nil
+}
+
+func (m *Manager) Compose(msg string) ([]pdu.ShortMessage, error) {
+	return Compose(msg)
+}
+
+func Compose(msg string) ([]pdu.ShortMessage, error) {
+	reference := uint16(rand.Intn(0xFFFF))
+	dataCoding := coding.BestSafeCoding(msg)
+	return pdu.ComposeMultipartShortMessage(msg, dataCoding, reference)
+}
+
+func parseSrcPhone(phone string) pdu.Address {
+	srcAddress := pdu.NewAddress()
+	if strings.HasPrefix(phone, "+") {
+		srcAddress.SetTon(1)
+		srcAddress.SetNpi(1)
+		_ = srcAddress.SetAddress(phone)
+		return srcAddress
+	}
+
+	if utf8.RuneCountInString(phone) <= 5 {
+		srcAddress.SetTon(3)
+		srcAddress.SetNpi(0)
+		_ = srcAddress.SetAddress(phone)
+		return srcAddress
+	}
+	if isLetter(phone) {
+
+		srcAddress.SetTon(5)
+		srcAddress.SetNpi(0)
+		_ = srcAddress.SetAddress(phone)
+		return srcAddress
+	}
+
+	srcAddress.SetTon(1)
+	srcAddress.SetNpi(1)
+	_ = srcAddress.SetAddress(phone)
+	return srcAddress
+}
+
+func parseDestPhone(phone string) pdu.Address {
+	destAddress := pdu.NewAddress()
+	if strings.HasPrefix(phone, "+") {
+		destAddress.SetTon(1)
+		destAddress.SetNpi(1)
+		_ = destAddress.SetAddress(phone)
+		return destAddress
+	}
+	destAddress.SetTon(0)
+	destAddress.SetNpi(1)
+	_ = destAddress.SetAddress(phone)
+	return destAddress
+}
+
+func isLetter(s string) bool {
+	for _, r := range s {
+		if !unicode.IsLetter(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func remove(s []string, r string) []string {
+	for i, v := range s {
+		if v == r {
+			return append(s[:i], s[i+1:]...)
+		}
+	}
+	return s
 }
